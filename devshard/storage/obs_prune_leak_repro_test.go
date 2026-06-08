@@ -46,6 +46,38 @@ func TestRepro_PruneBefore_LeaksValidationObsPartitions(t *testing.T) {
 		"validation-obs partitions for a pruned epoch must be DROPped, but pruneBefore omits the three obs parents -> per-epoch leak")
 }
 
+// TestRepro_PgPartitionEpoch_OmitsObsParents is the no-Docker proof of finding
+// #2. pruneBefore only drops a partition when pgPartitionEpoch recognizes its
+// name. ensurePartition creates obs partitions every epoch, yet pgPartitionEpoch
+// does not recognize any of the three obs parents -> they can never be dropped.
+func TestRepro_PgPartitionEpoch_OmitsObsParents(t *testing.T) {
+	// Recognized parents: pruneBefore can reclaim these.
+	for _, name := range []string{
+		"devshard_sessions_epoch_100",
+		"devshard_diffs_epoch_100",
+		"devshard_signatures_epoch_100",
+		"devshard_snapshots_epoch_100",
+		"devshard_sealed_inferences_epoch_100",
+	} {
+		ep, ok := pgPartitionEpoch(name)
+		require.True(t, ok, "%s should be recognized as prunable", name)
+		require.Equal(t, uint64(100), ep)
+	}
+
+	// The three validation-obs parents are created by ensurePartition every
+	// epoch but are NOT recognized here, so pruneBefore never drops them.
+	for _, name := range []string{
+		"devshard_slot_validation_obs_epoch_100",
+		"devshard_inference_validation_obs_epoch_100",
+		"devshard_sealed_validation_obs_epoch_100",
+	} {
+		_, ok := pgPartitionEpoch(name)
+		require.False(t, ok,
+			"LEAK: %s is created per-epoch but pgPartitionEpoch does not recognize it, "+
+				"so pruneBefore can never DROP it", name)
+	}
+}
+
 // listObsPartitions returns the validation-obs partition tables for a given
 // epoch that currently exist. Unlike listDevshardPartitions, it queries the
 // three obs parents the bug omits.
