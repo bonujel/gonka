@@ -77,6 +77,7 @@ func main() {
 		outPath      = flag.String("out", "", "summary CSV path (default routerload-<label>.csv)")
 		detailPath   = flag.String("detail", "", "optional per-request CSV (request_id, status, latency_ms, ts) for upstream trace lookup")
 		warmup       = flag.Bool("warmup", true, "send one probe request first to validate auth/reachability")
+		elicit       = flag.String("elicit", "", "instruction that makes the model produce a long answer (to match heavy real workload by actual output tokens)")
 	)
 	flag.Parse()
 
@@ -136,7 +137,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer summary.Close()
-	fmt.Fprintln(summary, "label,rps,sent,http_200,http_429,timeout,other,p50_ms,p95_ms,p99_ms,max_ms,max_inflight,first_429_offset_s")
+	fmt.Fprintln(summary, "label,rps,sent,http_200,http_429,timeout,other,p50_ms,p95_ms,p99_ms,max_ms,max_inflight,first_429_offset_s,avg_completion_tok")
 
 	var detail *os.File
 	if *detailPath != "" {
@@ -146,14 +147,14 @@ func main() {
 			os.Exit(1)
 		}
 		defer detail.Close()
-		fmt.Fprintln(detail, "request_id,rps_step,status,class,latency_ms,start_unix_ms")
+		fmt.Fprintln(detail, "request_id,rps_step,status,class,latency_ms,start_unix_ms,escrow,prompt_tok,completion_tok")
 	}
 
 	fmt.Printf("%-6s %-7s %-7s %-7s %-9s %-7s %-9s %-9s %-9s %-9s %-12s %-12s\n",
 		"rps", "sent", "200", "429", "timeout", "other", "p50ms", "p95ms", "p99ms", "maxms", "max_inflt", "first429@s")
 	fmt.Println(strings.Repeat("-", 120))
 
-	gen := &payloadGen{model: *model, maxTokens: *maxTokens, promptTokens: *promptTokens, stream: *stream}
+	gen := &payloadGen{model: *model, maxTokens: *maxTokens, promptTokens: *promptTokens, stream: *stream, elicit: *elicit}
 
 	for _, rps := range steps {
 		if ctx.Err() != nil {
@@ -185,12 +186,26 @@ type stepStats struct {
 	first429Set int32
 	latsMu      sync.Mutex
 	lats        []time.Duration
+	ctoks       []int // completion_tokens of 200s (actual output size)
 	body429Once sync.Once
 	body429     string
+	escMu       sync.Mutex
+	escrows     map[string]int // escrow id (from response) -> count of 200s served
+}
+
+// reqResult bundles everything one request produced.
+type reqResult struct {
+	status        int
+	class         string
+	lat           time.Duration
+	body          string // captured for 429/error
+	escrow        string
+	promptTok     int
+	completionTok int
 }
 
 func runStep(ctx context.Context, client *http.Client, url, apiKey string, gen *payloadGen, rps int, dur time.Duration, detail *os.File) *stepStats {
-	st := &stepStats{first429: -1}
+	st := &stepStats{first429: -1, escrows: map[string]int{}}
 	var inflight int64
 	var wg sync.WaitGroup
 
@@ -220,11 +235,11 @@ loop:
 				defer wg.Done()
 				defer atomic.AddInt64(&inflight, -1)
 				rid := newID()
-				status, class, lat, body := doRequest(ctx, client, url, apiKey, gen, rid)
-				st.record(class, status, lat, body, reqStart.Sub(stepStart))
+				r := doRequest(ctx, client, url, apiKey, gen, rid)
+				st.record(r, reqStart.Sub(stepStart))
 				if detail != nil {
 					detailMu.Lock()
-					fmt.Fprintf(detail, "%s,%d,%d,%s,%d,%d\n", rid, rps, status, class, lat.Milliseconds(), reqStart.UnixMilli())
+					fmt.Fprintf(detail, "%s,%d,%d,%s,%d,%d,%s,%d,%d\n", rid, rps, r.status, r.class, r.lat.Milliseconds(), reqStart.UnixMilli(), r.escrow, r.promptTok, r.completionTok)
 					detailMu.Unlock()
 				}
 			}(now)
@@ -236,8 +251,13 @@ loop:
 	return st
 }
 
-func (st *stepStats) record(class string, status int, lat time.Duration, body string, offset time.Duration) {
-	switch class {
+func (st *stepStats) record(r reqResult, offset time.Duration) {
+	if r.escrow != "" {
+		st.escMu.Lock()
+		st.escrows[r.escrow]++
+		st.escMu.Unlock()
+	}
+	switch r.class {
 	case "ok":
 		atomic.AddInt64(&st.http200, 1)
 	case "429":
@@ -245,26 +265,31 @@ func (st *stepStats) record(class string, status int, lat time.Duration, body st
 		if atomic.CompareAndSwapInt32(&st.first429Set, 0, 1) {
 			st.first429 = offset
 		}
-		st.body429Once.Do(func() { st.body429 = strings.TrimSpace(body) })
+		st.body429Once.Do(func() { st.body429 = strings.TrimSpace(r.body) })
 	case "timeout":
 		atomic.AddInt64(&st.timeouts, 1)
 	default:
 		atomic.AddInt64(&st.other, 1)
 	}
-	if lat > 0 {
+	if r.lat > 0 || r.completionTok > 0 {
 		st.latsMu.Lock()
-		st.lats = append(st.lats, lat)
+		if r.lat > 0 {
+			st.lats = append(st.lats, r.lat)
+		}
+		if r.completionTok > 0 {
+			st.ctoks = append(st.ctoks, r.completionTok)
+		}
 		st.latsMu.Unlock()
 	}
 }
 
 // ---- HTTP ----
 
-func doRequest(ctx context.Context, client *http.Client, url, apiKey string, gen *payloadGen, rid string) (status int, class string, lat time.Duration, body string) {
+func doRequest(ctx context.Context, client *http.Client, url, apiKey string, gen *payloadGen, rid string) reqResult {
 	payload := gen.build(rid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return 0, "other", 0, err.Error()
+		return reqResult{class: "other", body: err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -272,36 +297,89 @@ func doRequest(ctx context.Context, client *http.Client, url, apiKey string, gen
 
 	start := time.Now()
 	resp, err := client.Do(req)
-	lat = time.Since(start)
+	lat := time.Since(start)
 	if err != nil {
 		if ctx.Err() != nil {
-			return 0, "other", lat, "context cancelled"
+			return reqResult{class: "other", lat: lat, body: "context cancelled"}
 		}
 		// http.Client.Timeout and context deadline both surface here.
 		if isTimeout(err) {
-			return 0, "timeout", lat, err.Error()
+			return reqResult{class: "timeout", lat: lat, body: err.Error()}
 		}
-		return 0, "other", lat, err.Error()
+		return reqResult{class: "other", lat: lat, body: err.Error()}
 	}
 	defer resp.Body.Close()
 	// Read the body fully (capped) so keep-alive can reuse the connection,
-	// and so we can capture the 429 error body verbatim.
+	// and so we can capture the 429 body, the serving escrow id, and usage.
 	const capBody = 512
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	io.Copy(io.Discard, resp.Body)
+	pTok, cTok := extractUsage(rb)
+	res := reqResult{
+		status:        resp.StatusCode,
+		lat:           lat,
+		escrow:        extractEscrow(rb),
+		promptTok:     pTok,
+		completionTok: cTok,
+	}
 	snippet := string(rb)
 	if len(snippet) > capBody {
 		snippet = snippet[:capBody]
 	}
-
 	switch {
 	case resp.StatusCode == 200:
-		return resp.StatusCode, "ok", lat, ""
+		res.class = "ok"
 	case resp.StatusCode == 429:
-		return resp.StatusCode, "429", lat, snippet
+		res.class = "429"
+		res.body = snippet
 	default:
-		return resp.StatusCode, "other", lat, snippet
+		res.class = "other"
+		res.body = snippet
 	}
+	return res
+}
+
+// extractUsage pulls prompt_tokens / completion_tokens from a response body.
+func extractUsage(b []byte) (prompt, completion int) {
+	return intAfter(b, []byte(`"prompt_tokens":`)), intAfter(b, []byte(`"completion_tokens":`))
+}
+
+// intAfter returns the integer immediately following key in b (0 if absent).
+func intAfter(b, key []byte) int {
+	i := bytes.Index(b, key)
+	if i < 0 {
+		return 0
+	}
+	n, started := 0, false
+	for _, ch := range b[i+len(key):] {
+		switch {
+		case ch >= '0' && ch <= '9':
+			n = n*10 + int(ch-'0')
+			started = true
+		case ch == ' ' && !started:
+			continue
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+// extractEscrow pulls the escrow id out of a response body. Gonka response ids
+// look like "devshard-<escrowID>-<nonce>"; we return "devshard-<escrowID>".
+func extractEscrow(b []byte) string {
+	key := []byte(`"id":"devshard-`)
+	i := bytes.Index(b, key)
+	if i < 0 {
+		return ""
+	}
+	rest := b[i+len(key):]
+	// read the escrow number up to the next '-'
+	j := bytes.IndexByte(rest, '-')
+	if j < 0 {
+		return ""
+	}
+	return "devshard-" + string(rest[:j])
 }
 
 func probe(ctx context.Context, client *http.Client, url, apiKey, model string) error {
@@ -348,6 +426,7 @@ type payloadGen struct {
 	maxTokens    int
 	promptTokens int
 	stream       bool
+	elicit       string // if set, an instruction that makes the model produce a long answer
 }
 
 // build returns a unique, non-cacheable OpenAI chat-completions body. The
@@ -356,7 +435,14 @@ type payloadGen struct {
 func (g *payloadGen) build(rid string) []byte {
 	// ~4 chars/token rough heuristic. Padding is unique per request.
 	approxChars := g.promptTokens * 4
-	content := "req=" + rid + " " + uniqueFiller(approxChars)
+	var content string
+	if g.elicit != "" {
+		// Instruction that elicits a LONG response (to match a heavy real
+		// workload by actual output tokens), kept unique via rid.
+		content = g.elicit + " (request id " + rid + "; be exhaustive, do not stop early.) " + uniqueFiller(approxChars)
+	} else {
+		content = "req=" + rid + " " + uniqueFiller(approxChars)
+	}
 	m := map[string]any{
 		"model":      g.model,
 		"messages":   []map[string]string{{"role": "user", "content": content}},
@@ -402,10 +488,11 @@ func writeSummary(f *os.File, label string, rps int, st *stepStats) {
 	if st.first429 >= 0 {
 		first = strconv.FormatFloat(st.first429.Seconds(), 'f', 1, 64)
 	}
-	fmt.Fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
+	avgTok, _, _, _ := tokStats(st.ctoks)
+	fmt.Fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d\n",
 		label, rps, st.sent, st.http200, st.http429, st.timeouts, st.other,
 		p50.Milliseconds(), p95.Milliseconds(), p99.Milliseconds(), max.Milliseconds(),
-		st.maxInflight, first)
+		st.maxInflight, first, avgTok)
 	// Stash the first 429 body next to the CSV the first time we see one.
 	if st.body429 != "" {
 		fmt.Fprintf(os.Stderr, "  [rps=%d] first 429 body: %s\n", rps, st.body429)
@@ -422,6 +509,27 @@ func printStep(rps int, st *stepStats) {
 		rps, st.sent, st.http200, st.http429, st.timeouts, st.other,
 		p50.Milliseconds(), p95.Milliseconds(), p99.Milliseconds(), max.Milliseconds(),
 		st.maxInflight, first)
+	if len(st.escrows) > 0 {
+		fmt.Printf("        escrows serving this step: %v\n", st.escrows)
+	}
+	if avg, p50t, mx, n := tokStats(st.ctoks); n > 0 {
+		fmt.Printf("        output tokens: avg=%d p50=%d max=%d (n=%d)\n", avg, p50t, mx, n)
+	}
+}
+
+// tokStats returns avg, p50, max, count of completion-token samples.
+func tokStats(xs []int) (avg, p50, mx, n int) {
+	n = len(xs)
+	if n == 0 {
+		return
+	}
+	s := append([]int(nil), xs...)
+	sort.Ints(s)
+	sum := 0
+	for _, v := range s {
+		sum += v
+	}
+	return sum / n, s[n/2], s[n-1], n
 }
 
 func percentiles(lats []time.Duration) (p50, p95, p99, max time.Duration) {
