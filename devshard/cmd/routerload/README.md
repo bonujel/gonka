@@ -36,15 +36,23 @@ go run ./cmd/routerload \
 - **`first429@s`**:429 是一上来就有(稳态超限)还是跑了一会才出现(累积型,对应"撑一会→崩")。
 - RPS 能跑满全程且 `429+timeout` < ~1% 的最高档 = 可持续 RPS。
 
-## 1 vs 2 escrow 对比
+## 1 vs 2 escrow 对比 —— 用自建 gateway,不动线上
 
-escrow 数是 **router/服务端配置**,不是客户端开关。所以:
+escrow 数是 **gateway(=router)的配置**,不是客户端开关。最干净的测法是
+**自己起一个 gateway**(和线上同款 `devshardctl` 镜像),在上面切 1↔2 escrow,
+对线上零影响。完整步骤见 [testgateway/RUNBOOK.md](testgateway/RUNBOOK.md):
 
-1. 服务端配成 1 escrow → 跑一遍 `-label 1escrow`
-2. 服务端切成 2 escrow → 同样参数再跑 `-label 2escrow`
-3. diff 两份 CSV:同等 RPS 下 2 escrow 的 `max_inflight` 上限、429 率、吞吐变化
+1. 起 gateway(`testgateway/docker-compose.yml` + `config.devshard.env`)
+2. admin API 建 1 个 escrow → 跑 `-label 1escrow`
+3. admin API 再建 1 个 escrow(pool 模式自动负载均衡)→ 跑 `-label 2escrow`
+4. diff 两份 CSV:同等 RPS 下 `max_inflight` 上限、429 率、吞吐变化
 
-> ⚠️ 服务端怎么切 1↔2 escrow 需跟祖江/后端确认——本工具不负责切 escrow,只负责打流量。
+> 真凶大概率是 gateway 的 `GATEWAY_MAX_CONCURRENT_REQUESTS`(默认示例 512,
+> 配合 `DEVSHARD_CAPACITY_AWARE_LIMITS=on` 动态压低)——这就是
+> `too many concurrent requests` 的来源。测试前把这些参数调成和线上一致。
+>
+> 前置门槛:创建者地址要在链上白名单(走治理,不能自己加)+ 真 ngonka 押金。
+> 详见 RUNBOOK §0。
 
 ## 两个对照链路(强烈建议都跑)
 

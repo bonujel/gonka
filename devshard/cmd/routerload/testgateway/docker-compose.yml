@@ -1,0 +1,26 @@
+# Self-hosted Gonka devshard gateway for load testing — does NOT touch the
+# production router. Stand this up on your own Linux host, point routerload at
+# http://127.0.0.1:18080/v1/chat/completions, and flip 1<->2 escrows to A/B test.
+#
+# Source: gonka.ai "Run your own gateway" quickstart (§3.1), adapted for testing.
+# Prereqs (see RUNBOOK.md): allowlisted $DEVSHARD_CREATOR + funded creator wallet.
+services:
+  devshardctl:
+    container_name: ${DEVSHARD_INSTANCE_NAME:-devshardctl-loadtest}
+    image: libermans/gonka-devshard-proxy:latest
+    env_file:
+      - ./config.devshard.env
+    environment:
+      - DEVSHARD_PORT=8080
+      - DEVSHARD_STORAGE_DIR=/root/.devshardctl
+    volumes:
+      - ${DEVSHARD_STORAGE_HOST_DIR:-.devshardctl}:/root/.devshardctl
+    ports:
+      - "127.0.0.1:18080:8080"   # localhost only; routerload runs on the same host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

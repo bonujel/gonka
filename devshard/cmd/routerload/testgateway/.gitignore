@@ -1,0 +1,5 @@
+# Never commit filled-in secrets or run artifacts.
+config.devshard.env
+.devshardctl/
+*.csv
+settle-*.json
