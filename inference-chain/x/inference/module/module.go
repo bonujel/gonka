@@ -8,7 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
+	"strconv"
+	"sync"
 
 	"cosmossdk.io/collections"
 	"cosmossdk.io/core/appmodule"
@@ -58,6 +61,12 @@ var (
 const (
 	defaultInferencePruningThreshold = 4
 	defaultPocPruningThreshold       = 4
+	envExitAfterOneBlock             = "INFERENCE_EXIT_AFTER_ONE_BLOCK"
+)
+
+var (
+	exitAfterOneBlockOnce sync.Once
+	exitAfterBlockHeight  int64
 )
 
 // ----------------------------------------------------------------------------
@@ -177,6 +186,21 @@ func (AppModule) ConsensusVersion() uint64 { return 14 }
 
 // BeginBlock contains the logic that is automatically triggered at the beginning of each block.
 func (am AppModule) BeginBlock(ctx context.Context) error {
+	sdkCtx := sdk.UnwrapSDKContext(ctx)
+	height := sdkCtx.BlockHeight()
+
+	// Exit after one block is committed and computed (for debugging: set INFERENCE_EXIT_AFTER_ONE_BLOCK=1).
+	// We exit at the start of the next block's BeginBlock, so the previous block has already been committed.
+	if v := os.Getenv(envExitAfterOneBlock); v != "" {
+		if on, _ := strconv.ParseBool(v); on {
+			exitAfterOneBlockOnce.Do(func() { exitAfterBlockHeight = height + 1 })
+			if height == exitAfterBlockHeight {
+				sdkCtx.Logger().Info("Exiting after one block committed (INFERENCE_EXIT_AFTER_ONE_BLOCK)", "height", height)
+				os.Exit(0)
+			}
+		}
+	}
+
 	// Precompute SPRT values for the block
 	err := am.keeper.PrecomputeSPRTValues(ctx)
 	// We continue if there is something wrong with SPRT. Invalidation will effectively be turned off, but
@@ -200,6 +224,12 @@ func (am AppModule) BeginBlock(ctx context.Context) error {
 		am.LogError("Failed to build epoch data transient cache", types.Validation, "error", err)
 	}
 
+	// Process maintenance window lifecycle transitions (Scheduled->Active, Active->Completed)
+	err = am.keeper.ProcessMaintenanceTransitions(ctx)
+	if err != nil {
+		am.LogError("Failed to process maintenance transitions", types.Maintenance, "error", err)
+	}
+
 	return nil
 }
 
@@ -221,13 +251,17 @@ func (am AppModule) expireInferences(
 		return err
 	}
 
+	// Pre-build maintenance address set once to avoid repeated O(log N) lookups
+	// per expired inference in handleExpiredInferenceWithContext.
+	maintenanceAddrs := am.keeper.CollectActiveMaintenanceAddresses(ctx)
+
 	for _, i := range timeouts {
 		inference, found := am.keeper.GetInference(ctx, i.InferenceId)
 		if !found {
 			continue
 		}
 		if inference.Status == types.InferenceStatus_STARTED {
-			am.handleExpiredInferenceWithContext(ctx, inference, expiryCtx)
+			am.handleExpiredInferenceWithContext(ctx, inference, expiryCtx, maintenanceAddrs)
 		}
 	}
 	return nil
@@ -252,7 +286,7 @@ func (am AppModule) expireInferenceAndIssueRefund(ctx context.Context, inference
 	return inference
 }
 
-func (am AppModule) handleExpiredInferenceWithContext(ctx context.Context, inference types.Inference, expiryCtx *InferenceExpiryContext) {
+func (am AppModule) handleExpiredInferenceWithContext(ctx context.Context, inference types.Inference, expiryCtx *InferenceExpiryContext, maintenanceAddrs map[string]struct{}) {
 	executor, found := am.keeper.GetParticipant(ctx, inference.AssignedTo)
 	if !found {
 		am.LogWarn("Unable to find participant for expired inference", types.Inferences, "inferenceId", inference.InferenceId, "executedBy", inference.ExecutedBy)
@@ -304,6 +338,29 @@ func (am AppModule) handleExpiredInferenceWithContext(ctx context.Context, infer
 			"inPoCRange", expiryCtx.IsBlockInPoCRange(inference.StartBlockHeight) || expiryCtx.IsBlockInPoCRange(expiryCtx.CurrentBlockHeight))
 
 		// Still issue refund and mark as expired, but don't penalize executor
+		am.expireInferenceAndIssueRefund(ctx, inference)
+		return
+	}
+
+	// Executor has the required node — check maintenance exemption before penalizing.
+	// During active maintenance, expiry penalties are waived (the participant is
+	// expected to be offline and should not accumulate MissedRequests).
+	if _, inMaint := maintenanceAddrs[inference.AssignedTo]; inMaint {
+		am.LogInfo("Inference expired during active maintenance, waiving penalty",
+			types.Inferences,
+			"inferenceId", inference.InferenceId,
+			"executor", inference.AssignedTo,
+			"model", inference.Model,
+			"epochIndex", epochToCheck.Index)
+
+		sdkCtx := sdk.UnwrapSDKContext(ctx)
+		sdkCtx.EventManager().EmitEvent(sdk.NewEvent(
+			"maintenance_penalty_waived",
+			sdk.NewAttribute("inference_id", inference.InferenceId),
+			sdk.NewAttribute("executor", inference.AssignedTo),
+			sdk.NewAttribute("reason", "expiry_during_active_maintenance"),
+		))
+
 		am.expireInferenceAndIssueRefund(ctx, inference)
 		return
 	}
@@ -1366,6 +1423,7 @@ func GetTxCmd() *cobra.Command {
 
 	cmd.AddCommand(GrantMLOpsPermissionsCmd())
 	cmd.AddCommand(SettleDevshardEscrowCmd())
+	cmd.AddCommand(SetClaimRecipientsCmd())
 
 	return cmd
 }
