@@ -5,6 +5,7 @@ package user
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"slices"
 	"sync/atomic"
@@ -27,11 +28,11 @@ type KillableClient struct {
 	killed atomic.Bool
 }
 
-func (c *KillableClient) Send(ctx context.Context, req host.HostRequest) (*host.HostResponse, error) {
+func (c *KillableClient) Send(ctx context.Context, req host.HostRequest, stream io.Writer, receiptHandler func()) (*host.HostResponse, error) {
 	if c.killed.Load() {
 		return nil, fmt.Errorf("host killed")
 	}
-	return c.inner.Send(ctx, req)
+	return c.inner.Send(ctx, req, stream, receiptHandler)
 }
 
 func (c *KillableClient) Kill() { c.killed.Store(true) }
@@ -70,14 +71,14 @@ func runFault(t *testing.T, failPct int) {
 		ExecutionTimeout: 1200,
 		TokenPrice:       1,
 		VoteThreshold:    uint32(faultNumHosts) / 2,
-		ValidationRate:   5000,
+		ValidationRate:   types.DefaultValidationRate,
 	}
 	verifier := signing.NewSecp256k1Verifier()
 
 	killables := make([]*KillableClient, faultNumHosts)
 	clients := make([]HostClient, faultNumHosts)
 	for i := range hostSigners {
-		sm, err := state.NewStateMachine("escrow-fault", config, group, faultBalance, userKey.Address(), verifier)
+		sm, err := state.NewStateMachine("escrow-fault", config, group, faultBalance, userKey.Address(), verifier, testutil.MustMemoryStore(t, "escrow-fault", userKey.Address(), config, group, faultBalance))
 		require.NoError(t, err)
 		engine := stub.NewInferenceEngine()
 		h, err := host.NewHost(sm, hostSigners[i], engine, "escrow-fault", group, nil, host.WithGrace(grace))
@@ -87,7 +88,7 @@ func runFault(t *testing.T, failPct int) {
 		clients[i] = kc
 	}
 
-	userSM, err := state.NewStateMachine("escrow-fault", config, group, faultBalance, userKey.Address(), verifier)
+	userSM, err := state.NewStateMachine("escrow-fault", config, group, faultBalance, userKey.Address(), verifier, testutil.MustMemoryStore(t, "escrow-fault", userKey.Address(), config, group, faultBalance))
 	require.NoError(t, err)
 	session, err := NewSession(userSM, userKey, "escrow-fault", group, clients, verifier)
 	require.NoError(t, err)
@@ -278,8 +279,12 @@ func runFault(t *testing.T, failPct int) {
 	}
 
 	// --- Post-finalize status counts ---
+	// Terminal records seal once the nonce grace clears, and settlement drains
+	// every remaining live record into SealedAcc, so status accounting must
+	// read the merged live + sealed view rather than st.Inferences.
+	allRecords := session.StateMachine().ExportAllInferenceRecords()
 	statusCounts := make(map[types.InferenceStatus]int)
-	for _, rec := range st.Inferences {
+	for _, rec := range allRecords {
 		statusCounts[rec.Status]++
 	}
 
@@ -292,7 +297,10 @@ func runFault(t *testing.T, failPct int) {
 	// Dead executor slots with pending inferences should have missed > 0.
 	deadSlotsWithMissed := make(map[uint32]bool)
 	for _, infID := range pendingDeadIDs {
-		rec := st.Inferences[infID]
+		rec, ok := allRecords[infID]
+		require.True(t, ok, "inference %d missing from live and sealed records", infID)
+		require.Equal(t, types.StatusTimedOut, rec.Status,
+			"inference %d should be timed out, got %d", infID, rec.Status)
 		deadSlotsWithMissed[rec.ExecutorSlot] = true
 	}
 	totalMissed := 0
@@ -305,8 +313,7 @@ func runFault(t *testing.T, failPct int) {
 	require.Equal(t, len(pendingDeadIDs), totalMissed,
 		"total missed across dead slots should equal %d, got %d", len(pendingDeadIDs), totalMissed)
 
-	// Balance: timed-out inferences refund reserved cost. Finalize also
-	// applies seed reveals which settle finished inferences, so the exact
+	// Balance: timed-out inferences refund reserved cost, so the exact
 	// post-finalize balance is hard to predict. Verify balance increased
 	// relative to pre-finalize by at least the timeout refund amount.
 	timedOutRefund := uint64(len(pendingDeadIDs)) * reservedCostPerInf
@@ -314,33 +321,12 @@ func runFault(t *testing.T, failPct int) {
 		"balance should increase by at least timeout refund: pre=%d post=%d refund=%d",
 		expectedBalance, st.Balance, timedOutRefund)
 
-	// At least some alive hosts should have RequiredValidations > 0
-	// (from partial seed reveals during Finalize Phase A).
-	aliveWithReqVal := 0
 	for slot := uint32(0); slot < faultNumHosts; slot++ {
-		if !deadSlots[slot] && st.HostStats[slot].RequiredValidations > 0 {
-			aliveWithReqVal++
-		}
-	}
-	// Finalize processes at least one alive host before hitting a dead one,
-	// so we expect at least one alive host with req_val > 0.
-	require.Greater(t, aliveWithReqVal, 0,
-		"at least one alive host should have RequiredValidations > 0")
-
-	// Dead hosts that didn't reveal seeds should be penalized:
-	// RequiredValidations > 0 and CompletedValidations == 0.
-	for slot := uint32(0); slot < faultNumHosts; slot++ {
-		if !deadSlots[slot] {
-			continue
-		}
 		hs := st.HostStats[slot]
-		if st.RevealedSeeds[slot] != 0 {
-			continue // revealed before dying (shouldn't happen, but guard)
-		}
-		require.Greater(t, hs.RequiredValidations, uint32(0),
-			"dead slot %d should have RequiredValidations > 0 from penalty", slot)
-		require.Equal(t, uint32(0), hs.CompletedValidations,
-			"dead slot %d should have CompletedValidations == 0", slot)
+		require.Zero(t, hs.RequiredValidations,
+			"slot %d should keep RequiredValidations at 0", slot)
+		require.Zero(t, hs.CompletedValidations,
+			"slot %d should keep CompletedValidations at 0", slot)
 	}
 
 	// --- Report ---
@@ -373,8 +359,6 @@ func runFault(t *testing.T, failPct int) {
 	} else {
 		t.Logf("  finalize: failed as expected (%d/%d alive < threshold %d)", aliveHosts, faultNumHosts, threshold)
 	}
-	t.Logf("  alive hosts with req_val>0: %d", aliveWithReqVal)
-	t.Logf("  dead hosts penalized (req_val>0, comp_val=0): %d", numDead)
 	t.Logf("")
 	t.Logf("signatures: %d/%d alive hosts signed", len(signedAlive), faultNumHosts-numDead)
 	t.Logf("")

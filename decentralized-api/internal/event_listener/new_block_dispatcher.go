@@ -21,8 +21,6 @@ import (
 	"decentralized-api/internal/validation"
 	"decentralized-api/logging"
 
-	devshardpkg "devshard"
-
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
 	"github.com/productscience/inference/x/inference/types"
 	"google.golang.org/grpc"
@@ -41,6 +39,14 @@ type SetHeightFunc func(blockHeight int64) error
 
 type pocValidator interface {
 	ValidateAll(pocStageStartBlockHeight int64, pocStartBlockHash string)
+	// MaybeCaptureEarlyShare is invoked once per synced block to let the
+	// early-share guard capture the early on-chain commitment near the
+	// first-fraction boundary of the active PoC/CPoC generation window.
+	MaybeCaptureEarlyShare(epochState chainphase.EpochState)
+	// SyncArtifactStoreStage pins the current PoC/CPoC stage height in RAM
+	// while synced. The previous stage is unloaded only when that height
+	// changes (next PoC or confirmation PoC), not merely when leaving validate.
+	SyncArtifactStoreStage(epochState chainphase.EpochState)
 }
 
 // PoCParams contains Proof of Compute parameters
@@ -80,7 +86,6 @@ type OnNewBlockDispatcher struct {
 	configManager        *apiconfig.ConfigManager
 	validator            *validation.InferenceValidator
 	epochGroupDataCache  *internal.EpochGroupDataCache
-	availability         *devshardpkg.AvailabilityTracker
 	// onEpochState is set after the dispatcher is already running (the admin
 	// server is constructed later), so it is stored atomically to avoid a
 	// data race with ProcessNewBlock.
@@ -176,10 +181,6 @@ func NewOnNewBlockDispatcherFromCosmosClient(
 	return dispatcher
 }
 
-func (d *OnNewBlockDispatcher) SetAvailabilityTracker(tracker *devshardpkg.AvailabilityTracker) {
-	d.availability = tracker
-}
-
 // SetOnEpochState registers a hook invoked on every new block once the chain
 // is synced, with the freshly-updated epoch state.
 func (d *OnNewBlockDispatcher) SetOnEpochState(hook EpochStateHook) {
@@ -268,20 +269,9 @@ func (d *OnNewBlockDispatcher) ProcessNewBlock(ctx context.Context, blockInfo ch
 
 			// Update devshard versions cache from chain params
 			if params.Params.DevshardEscrowParams != nil {
-				versions := make([]apiconfig.DevshardVersion, len(params.Params.DevshardEscrowParams.ApprovedVersions))
-				for i, v := range params.Params.DevshardEscrowParams.ApprovedVersions {
-					versions[i] = apiconfig.DevshardVersion{
-						Name: v.Name, Binary: v.Binary, SHA256: v.Sha256,
-					}
-				}
-				d.configManager.SetDevshardVersions(apiconfig.DevshardVersionsCache{Versions: versions})
-				if d.availability != nil {
-					d.availability.Record(
-						params.Params.DevshardEscrowParams.DevshardRequestsEnabled,
-						time.Now().Unix(),
-						networkInfo.LatestEpoch.Index,
-					)
-				}
+				d.configManager.SetDevshardVersions(
+					apiconfig.DevshardVersionsCacheFromParams(params.Params.DevshardEscrowParams),
+				)
 			}
 		}
 	}
@@ -318,6 +308,17 @@ func (d *OnNewBlockDispatcher) ProcessNewBlock(ctx context.Context, blockInfo ch
 	if !epochState.IsSynced {
 		logging.Info("The blockchain node is still catching up, skipping on new block phase transitions", types.Stages)
 		return nil
+	}
+
+	// Pin/unpin the PoC artifact stage before any generate/validate work on
+	// this block so proof serving cannot race an unloaded store.
+	d.offChainValidator.SyncArtifactStoreStage(*epochState)
+
+	if d.configManager != nil && !strings.HasPrefix(blockInfo.Hash, "hash-") {
+		d.configManager.ApplyRuntimeConfigBlockIfChanged(
+			blockInfo.Height,
+			uint64(epochState.LatestEpoch.EpochIndex),
+		)
 	}
 
 	// 3. Check for phase transitions and stage events
@@ -389,6 +390,11 @@ func (d *OnNewBlockDispatcher) queryNetworkInfo(ctx context.Context) (NetworkInf
 
 // handlePhaseTransitions checks for and handles phase transitions and stage events
 func (d *OnNewBlockDispatcher) handlePhaseTransitions(epochState chainphase.EpochState) {
+	//To work for tests
+	if d.nodeBroker == nil {
+		return
+	}
+
 	epochContext := epochState.LatestEpoch
 	blockHeight := epochState.CurrentBlock.Height
 	blockHash := epochState.CurrentBlock.Hash
@@ -408,6 +414,13 @@ func (d *OnNewBlockDispatcher) handlePhaseTransitions(epochState chainphase.Epoc
 		d.randomSeedManager.GenerateSeedInfo(epochContext.EpochIndex)
 		return
 	}
+
+	// Early-share guard: between PoC start and end, capture the early on-chain
+	// commitments at the exact first-fraction height of the PoC/CPoC generation
+	// window (no-op when the guard is disabled or this block is not that height).
+	// Same exact-match form as the surrounding stage transitions; a missed height
+	// fails open for the stage.
+	d.offChainValidator.MaybeCaptureEarlyShare(epochState)
 
 	// Check for PoC validation stage transitions
 	if epochContext.IsEndOfPoCStage(blockHeight) {
@@ -593,6 +606,10 @@ func shouldTriggerReconciliation(blockHeight int64, config *MlNodeReconciliation
 
 // triggerReconciliation starts node reconciliation with current phase info
 func (d *OnNewBlockDispatcher) triggerReconciliation(epochState chainphase.EpochState) {
+	//To work for tests
+	if d.nodeBroker == nil {
+		return
+	}
 	cmd, response := getCommandForPhase(epochState)
 	if cmd == nil || response == nil {
 		logging.Info("[triggerReconciliation] No command required for phase", types.Nodes,

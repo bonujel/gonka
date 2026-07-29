@@ -172,6 +172,16 @@ func TestShouldStopValidationForStage(t *testing.T) {
 			expect:      false,
 		},
 		{
+			name: "transient not-synced state waits instead of cancelling",
+			state: func() *chainphase.EpochState {
+				s := createTestEpochState(types.PoCValidatePhase, 200, 100)
+				s.IsSynced = false
+				return s
+			}(),
+			stageHeight: 100,
+			expect:      false,
+		},
+		{
 			name:        "current validation stage continues",
 			state:       createTestEpochState(types.PoCValidatePhase, 200, 100),
 			stageHeight: 100,
@@ -238,6 +248,20 @@ func TestGetCurrentPocStageHeight_NilOrNotSynced(t *testing.T) {
 	notSynced := createTestEpochState(types.PoCGeneratePhase, 110, 100)
 	notSynced.IsSynced = false
 	assert.Equal(t, int64(0), GetCurrentPocStageHeight(notSynced))
+}
+
+func TestGetCurrentPocStageHeight_ConfirmationPoCChangesActiveStageHeight(t *testing.T) {
+	st := createTestEpochState(types.InferencePhase, 500, 100)
+	assert.Equal(t, int64(100), GetCurrentPocStageHeight(st))
+
+	st.ActiveConfirmationPoCEvent = &types.ConfirmationPoCEvent{
+		TriggerHeight: 400,
+		Phase:         types.ConfirmationPoCPhase_CONFIRMATION_POC_GENERATION,
+	}
+	assert.Equal(t, int64(400), GetCurrentPocStageHeight(st))
+
+	st.ActiveConfirmationPoCEvent.Phase = types.ConfirmationPoCPhase_CONFIRMATION_POC_VALIDATION
+	assert.Equal(t, int64(400), GetCurrentPocStageHeight(st))
 }
 
 func TestShouldAcceptStoreCommit_RegularPoC(t *testing.T) {

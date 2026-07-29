@@ -1,12 +1,15 @@
 .PHONY: all build-docker release
 
+include ../scripts/blst-portable.mk
+
 VERSION ?= $(shell git describe --always)
 SET_LATEST ?= 0
 SET_LATEST := $(shell if [ "$(SET_LATEST)" = "1" ]; then echo 1; else echo 0; fi)
 PLATFORMS ?= linux/amd64,linux/arm64
 USE_REGISTRY_CACHE ?= 0
+GHCR_CACHE_NAMESPACE ?= gonka-ai
 ifeq ($(USE_REGISTRY_CACHE),1)
-DOCKER_CACHE_ARGS := --cache-from type=registry,ref=ghcr.io/gonka-ai/proxy:buildcache --cache-to type=registry,ref=ghcr.io/gonka-ai/proxy:buildcache,mode=min
+DOCKER_CACHE_ARGS := --cache-from type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/proxy:buildcache --cache-to type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/proxy:buildcache,mode=min
 DOCKER_BUILD_PREFIX := docker buildx build --load $(DOCKER_CACHE_ARGS)
 else
 DOCKER_CACHE_ARGS :=
@@ -25,11 +28,8 @@ endef
 
 all: build-docker
 
-NATIVE_ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
-DOCKER_GOARCH ?= $(NATIVE_ARCH)
-
 build-docker:
-	$(eval PLATFORM=linux/$(DOCKER_GOARCH))
+	$(eval PLATFORM=$(DOCKER_PLATFORM))
 	$(eval DOCKER_FILE=Dockerfile)
 	$(eval DOCKER_TAG=ghcr.io/product-science/proxy:$(VERSION))
 	$(DOCKER_BUILD)

@@ -11,6 +11,8 @@ import (
 	"decentralized-api/mlnodeclient"
 	"decentralized-api/participant"
 	"decentralized-api/payloadstorage"
+	"net/http"
+	_ "net/http/pprof"
 
 	"cosmossdk.io/x/feegrant"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
@@ -91,6 +93,7 @@ func NewServer(
 	}
 
 	e.Use(middleware.LoggingMiddleware)
+	e.Any("/debug/pprof/*", echo.WrapHandler(http.DefaultServeMux))
 	g := e.Group("/admin/v1/")
 
 	g.POST("nodes", s.createNewNode)
@@ -116,7 +119,7 @@ func NewServer(
 	g.POST("models", s.registerModel)
 	g.POST("tx/send", s.sendTransaction)
 
-	g.POST("bls/request", s.postRequestThresholdSignature)
+	g.POST("bls/request", blsRequestDeprecated)
 
 	// Export DB state (human-readable JSON) for admin purposes
 	g.GET("export/db", s.exportDb)
