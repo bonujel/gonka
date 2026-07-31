@@ -987,17 +987,14 @@ data class LocalInferencePair(
         escrowId: Long,
         keyName: String? = null,
         port: Int = 18080 + escrowId.toInt(),
-        routePrefix: String? = null,
+        routePrefix: String,
         debugLogging: Boolean = false,
         model: String = defaultModel,
     ): DevshardProxyHandle =
         wrapLog("startDevshardProxy", true) {
             val privateKey = (if (keyName != null) node.getPrivateKey(keyName) else node.getColdPrivateKey()).trim()
             val stderrFile = devshardProxyLogPath(escrowId)
-            // Tests pin the route prefix explicitly so they are not coupled to
-            // devshardctl's release-default routing choice.
-            val effectiveRoutePrefix = routePrefix ?: "/v1/devshard"
-            val routePrefixEnv = " DEVSHARD_ROUTE_PREFIX='$effectiveRoutePrefix'"
+            val routePrefixEnv = " DEVSHARD_ROUTE_PREFIX='$routePrefix'"
             val logLevelEnv = if (debugLogging) " DEVSHARD_LOG_LEVEL=debug" else ""
             val startCommand = listOf(
                 "sh", "-c",
@@ -1057,12 +1054,12 @@ data class LocalInferencePair(
     }
 
     // Returns every inference the gateway knows about, keyed by inference id.
-    // Uses /v1/state (the per-runtime full state snapshot) which carries status and
-    // votes per inference.
+    // Uses /v1/debug/inferences (the full inference dump, split out of /v1/state)
+    // which carries status and votes per inference.
     fun getDevshardProxyInferences(proxyUrl: String): Map<Long, DevshardInferencePayload> {
         val raw = api.executor.exec(listOf(
             "sh", "-c",
-            "curl -sf $proxyUrl/v1/state -H 'Authorization: Bearer $devshardAdminApiKey'"
+            "curl -sf $proxyUrl/v1/debug/inferences -H 'Authorization: Bearer $devshardAdminApiKey'"
         ), null).joinToString("")
         val start = raw.indexOf('{')
         val end = raw.lastIndexOf('}')

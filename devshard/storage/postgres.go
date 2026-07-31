@@ -48,6 +48,11 @@ const (
 	// statement_timeout it also covers the time spent acquiring a pooled
 	// connection (pool exhaustion), which the server-side timeout cannot.
 	postgresOpTimeout = 8 * time.Second
+	// postgresLivePresenceTimeout bounds the HasAnySessionsLive query. It is
+	// deliberately short: the check runs under HybridStorage.markerMu right
+	// after a failed (often timed-out) create, so it must not extend the lock
+	// hold time by another full op timeout during an outage.
+	postgresLivePresenceTimeout = 2 * time.Second
 )
 
 const (
@@ -269,6 +274,49 @@ func (s *Postgres) lookupEpoch(escrowID string) (uint64, error) {
 		return 0, fmt.Errorf("%w: %s", ErrSessionNotFound, escrowID)
 	}
 	return epochID, nil
+}
+
+// HasEscrow reports whether escrowID is present in the in-memory routing index
+// (rebuilt at boot from devshard_session_index). It lets the hybrid router
+// resolve which backend owns an escrow.
+func (s *Postgres) HasEscrow(escrowID string) bool {
+	_, err := s.lookupEpoch(escrowID)
+	return err == nil
+}
+
+// HasAnySessions reports whether any escrow is still held in Postgres. The
+// in-memory index is kept in sync with devshard_session_index by CreateSession
+// and by prune, so this is an accurate emptiness check without a round trip.
+// The hybrid router uses it to clear the .pg-bound marker once PG is drained.
+func (s *Postgres) HasAnySessions() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.escrowIdx) > 0
+}
+
+// EscrowIDs returns a snapshot of escrows in the in-memory routing index.
+func (s *Postgres) EscrowIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.escrowIdx))
+	for id := range s.escrowIdx {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// HasAnySessionsLive checks devshard_session_index in the database itself.
+// The hybrid router uses it before clearing .pg-bound after a failed create:
+// a timed-out CreateSession may have committed server-side without updating
+// the in-memory index, so emptiness must be proven against the DB, not RAM.
+func (s *Postgres) HasAnySessionsLive() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), postgresLivePresenceTimeout)
+	defer cancel()
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM devshard_session_index)`).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // opCtx returns a context bounding a single storage operation. It caps both the
@@ -1011,6 +1059,9 @@ func (s *Postgres) PruneEpoch(epochID uint64) error {
 	if _, err := s.pool.Exec(ctx, `DELETE FROM devshard_session_index WHERE epoch_id = $1`, epochID); err != nil {
 		return fmt.Errorf("prune session index for epoch %d: %w", epochID, err)
 	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM devshard_escrow_cache WHERE epoch_id = $1`, epochID); err != nil {
+		return fmt.Errorf("prune escrow cache for epoch %d: %w", epochID, err)
+	}
 
 	s.mu.Lock()
 	delete(s.knownEpochs, epochID)
@@ -1064,6 +1115,9 @@ func (s *Postgres) pruneBefore(cutoff uint64) error {
 	if _, err := s.pool.Exec(ctx, `DELETE FROM devshard_session_index WHERE epoch_id < $1`, cutoff); err != nil {
 		return fmt.Errorf("prune session index before epoch %d: %w", cutoff, err)
 	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM devshard_escrow_cache WHERE epoch_id < $1`, cutoff); err != nil {
+		return fmt.Errorf("prune escrow cache before epoch %d: %w", cutoff, err)
+	}
 
 	s.mu.Lock()
 	for epochID := range s.knownEpochs {
@@ -1077,6 +1131,54 @@ func (s *Postgres) pruneBefore(cutoff uint64) error {
 		}
 	}
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *Postgres) PutEscrowCache(info EscrowCacheInfo) error {
+	raw, err := marshalEscrowCache(info)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := s.opCtx()
+	defer cancel()
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO devshard_escrow_cache (escrow_id, epoch_id, escrow_json, cached_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (escrow_id) DO UPDATE SET
+		  epoch_id = EXCLUDED.epoch_id,
+		  escrow_json = EXCLUDED.escrow_json,
+		  cached_at = EXCLUDED.cached_at`,
+		info.EscrowID, info.EpochID, raw, escrowCacheNowUnix(),
+	)
+	if err != nil {
+		return fmt.Errorf("put escrow cache: %w", err)
+	}
+	return nil
+}
+
+func (s *Postgres) GetEscrowCache(escrowID string) (*EscrowCacheInfo, error) {
+	ctx, cancel := s.opCtx()
+	defer cancel()
+	var raw string
+	err := s.pool.QueryRow(ctx,
+		`SELECT escrow_json FROM devshard_escrow_cache WHERE escrow_id = $1`, escrowID,
+	).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrEscrowCacheNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get escrow cache: %w", err)
+	}
+	return unmarshalEscrowCache(raw)
+}
+
+func (s *Postgres) DeleteEscrowCache(escrowID string) error {
+	ctx, cancel := s.opCtx()
+	defer cancel()
+	_, err := s.pool.Exec(ctx, `DELETE FROM devshard_escrow_cache WHERE escrow_id = $1`, escrowID)
+	if err != nil {
+		return fmt.Errorf("delete escrow cache: %w", err)
+	}
 	return nil
 }
 

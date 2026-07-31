@@ -249,6 +249,36 @@ func (s *SQLite) openOrLoadPool(epochID uint64) (*epochPool, error) {
 	return p, nil
 }
 
+// HasEscrow reports whether escrowID is present in the in-memory routing index
+// (rebuilt at boot from _meta.db). It lets the hybrid router resolve which
+// backend owns an escrow without a disk round trip.
+func (s *SQLite) HasEscrow(escrowID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.escrowIdx[escrowID]
+	return ok
+}
+
+// HasAnySessions reports whether SQLite still holds any session after startup
+// reconciliation. HybridStorage uses it to decide whether SQLite must stay
+// attached while Postgres handles new escrows.
+func (s *SQLite) HasAnySessions() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.escrowIdx) > 0
+}
+
+// EscrowIDs returns a snapshot of escrows in the in-memory routing index.
+func (s *SQLite) EscrowIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.escrowIdx))
+	for id := range s.escrowIdx {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // poolFor returns the pool for the epoch this escrow belongs to, opening it
 // lazily on first access. The escrow_id -> epoch_id lookup is in-memory
 // (rebuilt at boot from _meta.db); the pool itself is opened on demand so a
@@ -1019,7 +1049,7 @@ func (s *SQLite) DrainInferenceValidationObs(escrowID string, inferenceID uint64
 		return fmt.Errorf("drain inference validation obs select: %w", err)
 	}
 	type row struct {
-		slotID               uint32
+		slotID              uint32
 		required, completed uint32
 	}
 	var live []row
@@ -1123,6 +1153,9 @@ func (s *SQLite) PruneEpoch(epochID uint64) error {
 	if _, err := s.metaDB.Exec(`DELETE FROM escrow_epoch WHERE epoch_id = ?`, epochID); err != nil {
 		return fmt.Errorf("prune meta index for epoch %d: %w", epochID, err)
 	}
+	if _, err := s.metaDB.Exec(`DELETE FROM escrow_cache WHERE epoch_id = ?`, epochID); err != nil {
+		return fmt.Errorf("prune escrow cache for epoch %d: %w", epochID, err)
+	}
 	s.mu.Lock()
 	for esc, ep := range s.escrowIdx {
 		if ep == epochID {
@@ -1196,6 +1229,9 @@ func (s *SQLite) pruneBefore(cutoff uint64) error {
 	if _, err := s.metaDB.Exec(`DELETE FROM escrow_epoch WHERE epoch_id < ?`, cutoff); err != nil {
 		return fmt.Errorf("prune meta index before epoch %d: %w", cutoff, err)
 	}
+	if _, err := s.metaDB.Exec(`DELETE FROM escrow_cache WHERE epoch_id < ?`, cutoff); err != nil {
+		return fmt.Errorf("prune escrow cache before epoch %d: %w", cutoff, err)
+	}
 	s.mu.Lock()
 	for esc, ep := range s.escrowIdx {
 		if ep < cutoff {
@@ -1205,6 +1241,48 @@ func (s *SQLite) pruneBefore(cutoff uint64) error {
 	s.mu.Unlock()
 	if firstCloseErr != nil {
 		return firstCloseErr
+	}
+	return nil
+}
+
+func (s *SQLite) PutEscrowCache(info EscrowCacheInfo) error {
+	raw, err := marshalEscrowCache(info)
+	if err != nil {
+		return err
+	}
+	_, err = s.metaDB.Exec(
+		`INSERT INTO escrow_cache (escrow_id, epoch_id, escrow_json, cached_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(escrow_id) DO UPDATE SET
+		   epoch_id = excluded.epoch_id,
+		   escrow_json = excluded.escrow_json,
+		   cached_at = excluded.cached_at`,
+		info.EscrowID, info.EpochID, raw, escrowCacheNowUnix(),
+	)
+	if err != nil {
+		return fmt.Errorf("put escrow cache: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) GetEscrowCache(escrowID string) (*EscrowCacheInfo, error) {
+	var raw string
+	err := s.metaDB.QueryRow(
+		`SELECT escrow_json FROM escrow_cache WHERE escrow_id = ?`, escrowID,
+	).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, ErrEscrowCacheNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get escrow cache: %w", err)
+	}
+	return unmarshalEscrowCache(raw)
+}
+
+func (s *SQLite) DeleteEscrowCache(escrowID string) error {
+	_, err := s.metaDB.Exec(`DELETE FROM escrow_cache WHERE escrow_id = ?`, escrowID)
+	if err != nil {
+		return fmt.Errorf("delete escrow cache: %w", err)
 	}
 	return nil
 }

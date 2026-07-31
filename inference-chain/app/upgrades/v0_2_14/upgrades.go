@@ -10,10 +10,17 @@ package v0_2_14
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 
+	math "cosmossdk.io/math"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
+	wasmkeeper "github.com/CosmWasm/wasmd/x/wasm/keeper"
+	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/module"
+	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	mintkeeper "github.com/cosmos/cosmos-sdk/x/mint/keeper"
 
 	genesistransferkeeper "github.com/productscience/inference/x/genesistransfer/keeper"
 	genesistransfertypes "github.com/productscience/inference/x/genesistransfer/types"
@@ -21,11 +28,107 @@ import (
 	"github.com/productscience/inference/x/inference/types"
 )
 
+var devshardAllowedCreatorAddressesToAdd = []string{
+	// Dahl / @paranjko
+	"gonka1t9akhsrqjkavh68c7cannlfdj58y25vsewfflt",
+}
+
+const (
+	mainnetChainID                         = "gonka-mainnet"
+	legacyInferenceSealGraceFloor   uint32 = 20
+	legacyInferenceSealGraceSeconds uint32 = 3600
+)
+
+const BountyCommunitySaleContractAddress = "gonka18pkq9mwxxlmyq7kr5txhm060wemg2s4u94wvsfd9w2kdc0u99d6spk8pz2"
+const BountyIbcUsdtDenom = "ibc/115F68FBA220A028C6F6ED08EA0C1A9C8C52798B14FB66E6C89D5D8C06A524D4"
+
+func USDT(amount int64) int64 {
+	return amount * 1_000_000
+}
+
+type BountyReward struct {
+	Address string
+	Amount  int64
+}
+
+var bountyRewards = []BountyReward{
+	// RM: devshards v3 release management, review of 0.2.14 upgrade, HackerOne reviews.
+	// Public name: @akup
+	{Address: "gonka1ejkupq3cy6p8xd64ew2wlzveml86ckpzn9dl56", Amount: USDT(5000)},
+
+	// RM: release management, HackerOne reviews.
+	// Public name: @x0152
+	{Address: "gonka18enyz7h6hh5zjveee5wnhkhrcexamfz0zdxxqe", Amount: USDT(6000)},
+
+	// RM: release management, HackerOne reviews, R&D for MiniMax M2.7,
+	// Inference During PoC (including cost of GPUs for testing) and SMST optimization (PR #1432).
+	// Public name: @qdanik
+	{Address: "gonka1j3f2xkapx8cmczpjqcsrh7cc3peyj3ngkjv4p8", Amount: USDT(11500)},
+
+	// PR #1253: fix: stop stale PoC validation promptly.
+	// Public name: @ouicate
+	{Address: "gonka1f0elpwnx7ezytdlck35003nz6qk8kzvurvnj4a", Amount: USDT(1000)},
+
+	// PR #1255: fix(inference): settle accounts before releasing matured unbonding collateral.
+	// Public name: @ouicate
+	{Address: "gonka1f0elpwnx7ezytdlck35003nz6qk8kzvurvnj4a", Amount: USDT(1000)},
+
+	// PR #1278: bound event-listener tx queue to stop a single zero-fee attacker
+	// from OOMing validator nodes.
+	// Public name: @ouicate
+	{Address: "gonka1f0elpwnx7ezytdlck35003nz6qk8kzvurvnj4a", Amount: USDT(1000)},
+
+	// PR #1100: fix: prevent uint64 wrap in settle amount sums.
+	// Public name: @0xMayoor
+	{Address: "gonka1s8szs7n43jxgz4a4xaxmzm5emh7fmjxhach7w8", Amount: USDT(500)},
+
+	// PR #1101: fix: widen ShouldValidate to uint64 to prevent silent validation skip.
+	// Public name: @0xMayoor
+	{Address: "gonka1s8szs7n43jxgz4a4xaxmzm5emh7fmjxhach7w8", Amount: USDT(750)},
+
+	// PR #1347: fix(devshard): distribute unsettled escrow per slot, not per unique address.
+	// Public name: @0xMayoor
+	{Address: "gonka1s8szs7n43jxgz4a4xaxmzm5emh7fmjxhach7w8", Amount: USDT(500)},
+
+	// PR #1376: vulnerability finding (bridge block sync).
+	// Public name: @0xMayoor
+	{Address: "gonka1s8szs7n43jxgz4a4xaxmzm5emh7fmjxhach7w8", Amount: USDT(2000)},
+
+	// PR #889: on-chain configurable reward claim recipients.
+	// Public name: @alancapex
+	{Address: "gonka10mmdjau4dnj8krs7sh7t7635ttnmq9u3vqgz09", Amount: USDT(3000)},
+
+	// PR #998: implementing maintenance windows.
+	// Public name: @Ryanchen911
+	{Address: "gonka1zqss46r6jf6dhhyaa777kc2ppvjhn0ufkx4y57", Amount: USDT(7500)},
+
+	// PR #1307: fix(setup-report): avoid query-gas-limit on grant check.
+	// Public name: @redstartechno
+	{Address: "gonka105ce4495mj0mwkxqeasgdzqfq5jjrfq32eza5l", Amount: USDT(500)},
+
+	// Vulnerability report for #1378.
+	// Public name: @Lelouch33
+	{Address: "gonka128nd36m2pz5qcs4q6rd69622flyls05nleazqq", Amount: USDT(5000)},
+
+	// Vulnerability report for reward power-cap.
+	// Public name: @Lelouch33
+	{Address: "gonka128nd36m2pz5qcs4q6rd69622flyls05nleazqq", Amount: USDT(1000)},
+
+	// Vulnerability report and fix #1415
+	// Public name: @maksimenkoff
+	{Address: "gonka1gmuxdcxlsxn5z72elx77w9zym7yrgfxqgzg6ry", Amount: USDT(3000)},
+
+	// v0.2.13: review of the upgrade.
+	// Public name: @blizko
+	{Address: "gonka12jaf7m4eysyqt32mrgarum6z96vt55tckvcleq", Amount: USDT(1000)},
+}
+
 func CreateUpgradeHandler(
 	mm *module.Manager,
 	configurator module.Configurator,
 	k keeper.Keeper,
 	gtKeeper genesistransferkeeper.Keeper,
+	mintKeeper mintkeeper.Keeper,
 ) upgradetypes.UpgradeHandler {
 	return func(ctx context.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
 		k.LogInfo("starting upgrade", types.Upgrades, "version", UpgradeName)
@@ -41,16 +144,41 @@ func CreateUpgradeHandler(
 		if err := backfillDevshardEscrowParamDefaults(ctx, k); err != nil {
 			return nil, err
 		}
+		if err := setPocValidationVoteThreshold(ctx, k); err != nil {
+			return nil, err
+		}
+		if err := setDevshardAllowedCreatorAddresses(ctx, k); err != nil {
+			return nil, err
+		}
 		if err := backfillDevshardEscrowFees(ctx, k); err != nil {
 			return nil, err
 		}
 		if err := backfillDevshardEscrowInferenceSealGrace(ctx, k); err != nil {
 			return nil, err
 		}
+		if err := seedDelegationRewardSnapshotForEffectiveEpoch(ctx, k); err != nil {
+			return nil, err
+		}
+		if err := zeroMintInflation(ctx, k, mintKeeper); err != nil {
+			return nil, err
+		}
+		if err := burnFeeCollectorBalance(ctx, k); err != nil {
+			return nil, err
+		}
+
+		// Initialize maintenance params with defaults for existing chains.
+		// All participants start with zero credit — credit is earned going forward.
+		if err := initMaintenanceParams(ctx, k); err != nil {
+			return nil, err
+		}
 
 		// Update genesistransfer params to enable the whitelist and restrict to founders
 		if err := updateGenesisTransferParams(ctx, gtKeeper); err != nil {
 			return nil, fmt.Errorf("update genesistransfer params: %w", err)
+		}
+
+		if err := distributeBountyRewards(ctx, k); err != nil {
+			return nil, err
 		}
 
 		toVM, err := mm.RunMigrations(ctx, configurator, fromVM)
@@ -61,6 +189,203 @@ func CreateUpgradeHandler(
 		k.LogInfo("successfully upgraded", types.Upgrades, "version", UpgradeName)
 		return toVM, nil
 	}
+}
+
+func zeroMintInflation(ctx context.Context, k keeper.Keeper, mintKeeper mintkeeper.Keeper) error {
+	params, err := mintKeeper.Params.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("get mint params: %w", err)
+	}
+
+	oldInflationMax := params.InflationMax
+	oldInflationMin := params.InflationMin
+	oldInflationRateChange := params.InflationRateChange
+	params.InflationMax = math.LegacyZeroDec()
+	params.InflationMin = math.LegacyZeroDec()
+	params.InflationRateChange = math.LegacyZeroDec()
+	if err := mintKeeper.Params.Set(ctx, params); err != nil {
+		return fmt.Errorf("set mint params: %w", err)
+	}
+
+	minter, err := mintKeeper.Minter.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("get mint minter: %w", err)
+	}
+
+	oldInflation := minter.Inflation
+	oldAnnualProvisions := minter.AnnualProvisions
+	minter.Inflation = math.LegacyZeroDec()
+	minter.AnnualProvisions = math.LegacyZeroDec()
+	if err := mintKeeper.Minter.Set(ctx, minter); err != nil {
+		return fmt.Errorf("set mint minter: %w", err)
+	}
+
+	k.LogInfo("zeroed mint inflation", types.Upgrades,
+		"old_inflation_max", oldInflationMax.String(),
+		"old_inflation_min", oldInflationMin.String(),
+		"old_inflation_rate_change", oldInflationRateChange.String(),
+		"old_inflation", oldInflation.String(),
+		"old_annual_provisions", oldAnnualProvisions.String(),
+		"new_inflation_max", params.InflationMax.String(),
+		"new_inflation_min", params.InflationMin.String(),
+		"new_inflation_rate_change", params.InflationRateChange.String(),
+		"new_inflation", minter.Inflation.String(),
+		"new_annual_provisions", minter.AnnualProvisions.String(),
+	)
+	return nil
+}
+
+func burnFeeCollectorBalance(ctx context.Context, k keeper.Keeper) error {
+	feeCollectorAddress := authtypes.NewModuleAddress(authtypes.FeeCollectorName)
+	balance := k.BankView.GetAllBalances(ctx, feeCollectorAddress)
+	burnAmount := balance.AmountOf(types.BaseCoin)
+	if burnAmount.IsZero() {
+		k.LogInfo("burn fee collector balance skipped: no base denom balance", types.Upgrades,
+			"denom", types.BaseCoin,
+			"fee_collector_balance", balance.String(),
+		)
+		return nil
+	}
+
+	burnCoins := sdk.NewCoins(sdk.NewCoin(types.BaseCoin, burnAmount))
+	const memo = "v0.2.14: burn erroneously minted inflation"
+	if err := k.BankKeeper.SendCoinsFromModuleToModule(ctx, authtypes.FeeCollectorName, types.ModuleName, burnCoins, memo); err != nil {
+		return fmt.Errorf("transfer fee collector balance to inference module for burn: %w", err)
+	}
+	if err := k.BankKeeper.BurnCoins(ctx, types.ModuleName, burnCoins, memo); err != nil {
+		return fmt.Errorf("burn fee collector balance: %w", err)
+	}
+
+	k.LogInfo("burned fee collector balance", types.Upgrades,
+		"amount", burnCoins.String(),
+		"fee_collector_balance", balance.String(),
+	)
+	return nil
+}
+
+func setDevshardAllowedCreatorAddresses(ctx context.Context, k keeper.Keeper) error {
+	if isTestnet(ctx) {
+		return nil
+	}
+	return addDevshardAllowedCreatorAddresses(ctx, k, devshardAllowedCreatorAddressesToAdd)
+}
+
+func addDevshardAllowedCreatorAddresses(ctx context.Context, k keeper.Keeper, addresses []string) error {
+	params, err := k.GetParams(ctx)
+	if err != nil {
+		return err
+	}
+	if params.DevshardEscrowParams == nil {
+		params.DevshardEscrowParams = types.DefaultDevshardEscrowParams()
+	}
+
+	seen := make(map[string]struct{}, len(params.DevshardEscrowParams.AllowedCreatorAddresses)+len(addresses))
+	for _, address := range params.DevshardEscrowParams.AllowedCreatorAddresses {
+		seen[address] = struct{}{}
+	}
+
+	added := 0
+	for _, address := range addresses {
+		if _, ok := seen[address]; ok {
+			continue
+		}
+		params.DevshardEscrowParams.AllowedCreatorAddresses = append(params.DevshardEscrowParams.AllowedCreatorAddresses, address)
+		seen[address] = struct{}{}
+		added++
+	}
+
+	if err := k.SetParams(ctx, params); err != nil {
+		return err
+	}
+	k.LogInfo("set devshard allowed creator addresses", types.Upgrades,
+		"total", len(params.DevshardEscrowParams.AllowedCreatorAddresses),
+		"added", added)
+	return nil
+}
+
+func seedDelegationRewardSnapshotForEffectiveEpoch(ctx context.Context, k keeper.Keeper) error {
+	effectiveEpochIndex, found := k.GetEffectiveEpochIndex(ctx)
+	if !found {
+		k.LogError("seed delegation reward snapshot skipped: effective epoch not found", types.Upgrades)
+		return nil
+	}
+
+	snapshot, snapshotFound := k.GetDelegationRewardTransferSnapshot(ctx)
+	if snapshotFound {
+		if snapshot.EpochIndex != effectiveEpochIndex {
+			k.LogWarn("existing delegation reward snapshot epoch differs from effective epoch", types.Upgrades,
+				"snapshot_epoch", snapshot.EpochIndex, "effective_epoch", effectiveEpochIndex)
+		}
+		return nil
+	}
+
+	if err := k.SetDelegationRewardTransferSnapshot(ctx, types.DelegationRewardTransferSnapshot{
+		EpochIndex: effectiveEpochIndex,
+	}); err != nil {
+		return err
+	}
+
+	k.LogInfo("seeded delegation reward snapshot for effective epoch", types.Upgrades, "epoch", effectiveEpochIndex)
+	return nil
+}
+
+// initMaintenanceParams initializes the MaintenanceParams sub-struct with defaults.
+// The feature starts disabled; governance can enable it once the network is ready.
+// No per-participant state initialization is needed because:
+//   - MaintenanceState is lazily created via GetOrCreateMaintenanceState
+//   - Credit starts at zero (the default for a missing entry)
+//   - Maintenance collections (reservations, transitions, indexes) start empty
+//
+// This is the seeding step from the maintenance-windows PR (#998), relocated
+// from the v0.2.12 handler: mainnet executed that upgrade before the feature
+// landed, so it could never run there. Two deliberate deviations from the
+// original: errors are returned instead of logged-and-swallowed (matching the
+// other v0.2.14 migrations, so a failed SetParams halts the upgrade), and
+// existing non-nil params short-circuit without a redundant SetParams
+// round-trip.
+func initMaintenanceParams(ctx context.Context, k keeper.Keeper) error {
+	params, err := k.GetParams(ctx)
+	if err != nil {
+		return err
+	}
+	if params.MaintenanceParams != nil {
+		k.LogInfo("maintenance params already present, skipping init", types.Upgrades,
+			"maintenance_enabled", params.MaintenanceParams.MaintenanceEnabled)
+		return nil
+	}
+
+	params.MaintenanceParams = types.DefaultMaintenanceParams()
+	if err := k.SetParams(ctx, params); err != nil {
+		return err
+	}
+
+	k.LogInfo("initialized maintenance params", types.Upgrades,
+		"maintenance_enabled", params.MaintenanceParams.MaintenanceEnabled,
+		"min_schedule_lead_blocks", params.MaintenanceParams.MaintenanceMinScheduleLeadBlocks,
+		"max_window_blocks", params.MaintenanceParams.MaintenanceMaxWindowBlocks,
+		"max_concurrent_validators", params.MaintenanceParams.MaintenanceMaxConcurrentValidators,
+		"max_concurrent_power_bps", params.MaintenanceParams.MaintenanceMaxConcurrentPowerBps,
+		"credit_cap_blocks", params.MaintenanceParams.MaintenanceCreditCapBlocks,
+		"credit_earn_per_epoch_blocks", params.MaintenanceParams.MaintenanceCreditEarnPerSuccessfulEpochBlocks,
+	)
+	return nil
+}
+
+func setPocValidationVoteThreshold(ctx context.Context, k keeper.Keeper) error {
+	params, err := k.GetParams(ctx)
+	if err != nil {
+		return err
+	}
+	if params.PocParams == nil {
+		params.PocParams = types.DefaultPocParams()
+	}
+	params.PocParams.ValidationVoteThresholdBps = types.DefaultPocValidationVoteThresholdBps
+	if err := k.SetParams(ctx, params); err != nil {
+		return err
+	}
+	k.LogInfo("set PoC validation vote threshold", types.Upgrades,
+		"validation_vote_threshold_bps", params.PocParams.ValidationVoteThresholdBps)
+	return nil
 }
 
 // backfillDevshardEscrowParamDefaults seeds zero-valued DevshardEscrowParams
@@ -187,20 +512,10 @@ func backfillDevshardEscrowFees(ctx context.Context, k keeper.Keeper) error {
 	return nil
 }
 
-// backfillDevshardEscrowInferenceSealGrace populates per-escrow inference seal
-// grace snapshots on DevshardEscrow rows created before those fields existed.
-// Rows that already carry a non-zero snapshot are left untouched.
+// backfillDevshardEscrowInferenceSealGrace freezes the historical devshard
+// fallback on escrows created before seal-grace snapshots existed. New escrows
+// receive the current defaults when they are created.
 func backfillDevshardEscrowInferenceSealGrace(ctx context.Context, k keeper.Keeper) error {
-	params, err := k.GetParams(ctx)
-	if err != nil {
-		return err
-	}
-	if params.DevshardEscrowParams == nil {
-		k.LogInfo("backfill devshard escrow inference seal grace skipped: devshard escrow params missing", types.Upgrades)
-		return nil
-	}
-	ep := params.DevshardEscrowParams
-
 	var updateIDs []uint64
 	if err := k.DevshardEscrows.Walk(ctx, nil, func(_ uint64, escrow types.DevshardEscrow) (bool, error) {
 		if escrow.InferenceSealGraceNonces != 0 && escrow.InferenceSealGraceSeconds != 0 {
@@ -218,19 +533,19 @@ func backfillDevshardEscrowInferenceSealGrace(ctx context.Context, k keeper.Keep
 			return fmt.Errorf("get devshard escrow %d during inference seal grace backfill: not found", id)
 		}
 		if escrow.InferenceSealGraceNonces == 0 {
-			escrow.InferenceSealGraceNonces = types.DevshardInferenceSealGraceNoncesForCreate(ep, uint32(len(escrow.Slots)))
+			escrow.InferenceSealGraceNonces = legacyInferenceSealGraceNonces(uint32(len(escrow.Slots)))
 		}
 		if escrow.InferenceSealGraceSeconds == 0 {
-			escrow.InferenceSealGraceSeconds = types.DevshardInferenceSealGraceSecondsForCreate(ep)
+			escrow.InferenceSealGraceSeconds = legacyInferenceSealGraceSeconds
 		}
 		if err := k.SetDevshardEscrow(ctx, escrow); err != nil {
 			return fmt.Errorf("set devshard escrow %d during inference seal grace backfill: %w", escrow.Id, err)
 		}
 	}
-	k.LogInfo("backfilled devshard escrow inference seal grace", types.Upgrades,
+	k.LogInfo("backfilled legacy devshard escrow inference seal grace", types.Upgrades,
 		"updated", len(updateIDs),
-		"default_inference_seal_grace_nonces", ep.DefaultInferenceSealGraceNonces,
-		"default_inference_seal_grace_seconds", ep.DefaultInferenceSealGraceSeconds,
+		"nonce_floor", legacyInferenceSealGraceFloor,
+		"seconds", legacyInferenceSealGraceSeconds,
 	)
 	return nil
 }
@@ -287,4 +602,83 @@ func updateGenesisTransferParams(ctx context.Context, gtKeeper genesistransferke
 		RestrictToList:  true,
 	}
 	return gtKeeper.SetParams(ctx, params)
+}
+
+func distributeBountyRewards(ctx context.Context, k keeper.Keeper) error {
+	if len(bountyRewards) == 0 {
+		k.Logger().Info("No bounty rewards to distribute")
+		return nil
+	}
+
+	communitySaleAddr, err := sdk.AccAddressFromBech32(BountyCommunitySaleContractAddress)
+	if err != nil {
+		k.Logger().Error("invalid hardcoded community sale contract address", "address", BountyCommunitySaleContractAddress, "error", err)
+		return nil
+	}
+	authorityAddr, err := sdk.AccAddressFromBech32(k.GetAuthority())
+	if err != nil {
+		k.Logger().Error("invalid authority address", "authority", k.GetAuthority(), "error", err)
+		return nil
+	}
+
+	var totalRequired int64
+	for _, bounty := range bountyRewards {
+		totalRequired += bounty.Amount
+	}
+
+	available := k.BankView.SpendableCoin(ctx, communitySaleAddr, BountyIbcUsdtDenom).Amount.Int64()
+	if available < totalRequired {
+		k.Logger().Warn("insufficient community sale balance, skipping bounty distribution",
+			"required", totalRequired, "available", available, "denom", BountyIbcUsdtDenom)
+		return nil
+	}
+
+	k.Logger().Info("community sale balance sufficient for bounty distribution",
+		"required", totalRequired, "available", available, "denom", BountyIbcUsdtDenom)
+
+	permissionedKeeper := wasmkeeper.NewGovPermissionKeeper(k.GetWasmKeeper())
+	sdkCtx := sdk.UnwrapSDKContext(ctx)
+	for _, bounty := range bountyRewards {
+		recipient, err := sdk.AccAddressFromBech32(bounty.Address)
+		if err != nil {
+			k.Logger().Error("invalid bounty address", "address", bounty.Address, "error", err)
+			continue
+		}
+
+		msgBz, err := json.Marshal(map[string]any{
+			"withdraw_ibc": map[string]string{
+				"denom":     BountyIbcUsdtDenom,
+				"amount":    strconv.FormatInt(bounty.Amount, 10),
+				"recipient": recipient.String(),
+			},
+		})
+		if err != nil {
+			k.Logger().Error("failed to marshal community sale withdraw message", "address", bounty.Address, "error", err)
+			continue
+		}
+
+		if _, err := permissionedKeeper.Execute(sdkCtx, communitySaleAddr, authorityAddr, msgBz, sdk.NewCoins()); err != nil {
+			k.Logger().Error("failed to distribute bounty from community sale contract",
+				"address", bounty.Address, "amount", bounty.Amount, "denom", BountyIbcUsdtDenom, "error", err)
+			continue
+		}
+
+		k.Logger().Info("bounty distributed from community sale contract",
+			"address", bounty.Address, "amount", bounty.Amount, "denom", BountyIbcUsdtDenom)
+	}
+
+	return nil
+}
+
+// ######### Utils #########
+
+func isTestnet(ctx context.Context) bool {
+	return sdk.UnwrapSDKContext(ctx).ChainID() != mainnetChainID
+}
+
+func legacyInferenceSealGraceNonces(slotCount uint32) uint32 {
+	if slotCount < legacyInferenceSealGraceFloor {
+		return legacyInferenceSealGraceFloor
+	}
+	return slotCount
 }

@@ -84,6 +84,17 @@ func (m *ManagedStorage) CurrentEpochID() uint64 {
 	return m.maxObservedEpoch.Load()
 }
 
+func (m *ManagedStorage) PruneCutoff() uint64 {
+	if m.epochs != nil {
+		m.observe(m.epochs.CurrentEpochID())
+	}
+	maxE := m.maxObservedEpoch.Load()
+	if maxE+1 <= m.retain {
+		return 0
+	}
+	return maxE + 1 - m.retain
+}
+
 // Start runs a single catch-up prune after recovery. Epoch transitions must
 // trigger additional PruneOnce calls via the host's epoch-change hook.
 func (m *ManagedStorage) Start() {
@@ -110,10 +121,10 @@ func (m *ManagedStorage) PruneOnce(_ context.Context) {
 		m.observe(m.epochs.CurrentEpochID())
 	}
 	maxE := m.maxObservedEpoch.Load()
-	if maxE+1 <= m.retain {
+	cutoff := m.PruneCutoff()
+	if cutoff == 0 {
 		return // not enough epochs yet
 	}
-	cutoff := maxE + 1 - m.retain // every epoch < cutoff is pruneable
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -227,6 +238,41 @@ func (m *ManagedStorage) DrainInferenceValidationObs(escrowID string, inferenceI
 
 func (m *ManagedStorage) GetValidationObservability(escrowID string) ([]SlotValidationObs, error) {
 	return m.inner.GetValidationObservability(escrowID)
+}
+
+func (m *ManagedStorage) PutEscrowCache(info EscrowCacheInfo) error {
+	m.mu.RLock()
+	prunedUpTo := m.prunedUpTo
+	m.mu.RUnlock()
+	if info.EpochID < prunedUpTo {
+		slog.Warn("devshard managed storage: escrow cache put skipped; epoch pruned",
+			"escrow_id", info.EscrowID,
+			"epoch_id", info.EpochID,
+			"pruned_up_to", prunedUpTo)
+		return nil
+	}
+	if err := m.inner.PutEscrowCache(info); err != nil {
+		slog.Warn("devshard managed storage: escrow cache put failed",
+			"escrow_id", info.EscrowID,
+			"epoch_id", info.EpochID,
+			"error", err)
+		return nil
+	}
+	m.observe(info.EpochID)
+	return nil
+}
+
+func (m *ManagedStorage) GetEscrowCache(escrowID string) (*EscrowCacheInfo, error) {
+	return m.inner.GetEscrowCache(escrowID)
+}
+
+func (m *ManagedStorage) DeleteEscrowCache(escrowID string) error {
+	if err := m.inner.DeleteEscrowCache(escrowID); err != nil {
+		slog.Warn("devshard managed storage: escrow cache delete failed",
+			"escrow_id", escrowID,
+			"error", err)
+	}
+	return nil
 }
 
 // PruneEpoch is exposed so callers can trigger an explicit drop. PruneOnce uses

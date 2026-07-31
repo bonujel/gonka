@@ -38,6 +38,14 @@ type SetHeightFunc func(blockHeight int64) error
 
 type pocValidator interface {
 	ValidateAll(pocStageStartBlockHeight int64, pocStartBlockHash string)
+	// MaybeCaptureEarlyShare is invoked once per synced block to let the
+	// early-share guard capture the early on-chain commitment near the
+	// first-fraction boundary of the active PoC/CPoC generation window.
+	MaybeCaptureEarlyShare(epochState chainphase.EpochState)
+	// SyncArtifactStoreStage pins the current PoC/CPoC stage height in RAM
+	// while synced. The previous stage is unloaded only when that height
+	// changes (next PoC or confirmation PoC), not merely when leaving validate.
+	SyncArtifactStoreStage(epochState chainphase.EpochState)
 }
 
 // PoCParams contains Proof of Compute parameters
@@ -286,6 +294,10 @@ func (d *OnNewBlockDispatcher) ProcessNewBlock(ctx context.Context, blockInfo ch
 		return nil
 	}
 
+	// Pin/unpin the PoC artifact stage before any generate/validate work on
+	// this block so proof serving cannot race an unloaded store.
+	d.offChainValidator.SyncArtifactStoreStage(*epochState)
+
 	if d.configManager != nil && !strings.HasPrefix(blockInfo.Hash, "hash-") {
 		d.configManager.ApplyRuntimeConfigBlockIfChanged(
 			blockInfo.Height,
@@ -375,6 +387,13 @@ func (d *OnNewBlockDispatcher) handlePhaseTransitions(epochState chainphase.Epoc
 		d.randomSeedManager.GenerateSeedInfo(epochContext.EpochIndex)
 		return
 	}
+
+	// Early-share guard: between PoC start and end, capture the early on-chain
+	// commitments at the exact first-fraction height of the PoC/CPoC generation
+	// window (no-op when the guard is disabled or this block is not that height).
+	// Same exact-match form as the surrounding stage transitions; a missed height
+	// fails open for the stage.
+	d.offChainValidator.MaybeCaptureEarlyShare(epochState)
 
 	// Check for PoC validation stage transitions
 	if epochContext.IsEndOfPoCStage(blockHeight) {

@@ -36,7 +36,7 @@ type epochParamsProvider interface {
 // paramsProviderResult holds the active provider and optional epoch-prune hook.
 type paramsProviderResult struct {
 	Provider           epochParamsProvider
-	RegisterEpochPrune func(store *devshardstorage.ManagedStorage) (cancel func())
+	RegisterEpochPrune func(store *devshardstorage.ManagedStorage, evict func(cutoff uint64)) (cancel func())
 	// Source is "adaptive" or "chain"; surfaced for tests / structured logs.
 	Source string
 	// ActiveSource reports grpc|chain when Source is adaptive; nil for chain-only.
@@ -53,6 +53,21 @@ func runtimeConfigSettingsFromEnv() (serverMaxWait, deadlineSlack time.Duration)
 		}
 	}
 	if s := strings.TrimSpace(os.Getenv("DEVSHARDD_RUNTIME_CONFIG_CLIENT_DEADLINE_SLACK_SECONDS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			deadlineSlack = time.Duration(n) * time.Second
+		}
+	}
+	return serverMaxWait, deadlineSlack
+}
+
+func hostEventsSettingsFromEnv() (serverMaxWait, deadlineSlack time.Duration) {
+	serverMaxWait, deadlineSlack = runtimeConfigSettingsFromEnv()
+	if s := strings.TrimSpace(os.Getenv("DEVSHARDD_HOST_EVENTS_MAX_WAIT_SECONDS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			serverMaxWait = time.Duration(n) * time.Second
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("DEVSHARDD_HOST_EVENTS_CLIENT_DEADLINE_SLACK_SECONDS")); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
 			deadlineSlack = time.Duration(n) * time.Second
 		}
@@ -201,7 +216,7 @@ func newAdaptiveParamsResult(
 		ProbeTimeout:       probeTimeout,
 		StaleCheckInterval: staleCheck,
 		Availability:       availability,
-		Log:                  logger,
+		Log:                logger,
 	})
 	if err != nil {
 		return nil, err
@@ -209,9 +224,12 @@ func newAdaptiveParamsResult(
 
 	return &paramsProviderResult{
 		Provider: rc,
-		RegisterEpochPrune: func(store *devshardstorage.ManagedStorage) (cancel func()) {
+		RegisterEpochPrune: func(store *devshardstorage.ManagedStorage, evict func(cutoff uint64)) (cancel func()) {
 			return rc.OnEpochChange(func(_, _ uint64) {
 				store.PruneOnceAsync(ctx)
+				if evict != nil {
+					evict(store.PruneCutoff())
+				}
 			})
 		},
 		Source: paramsSourceAdaptive,
@@ -250,9 +268,12 @@ func newChainParamsResult(
 
 	return &paramsProviderResult{
 		Provider: rc,
-		RegisterEpochPrune: func(store *devshardstorage.ManagedStorage) (cancel func()) {
+		RegisterEpochPrune: func(store *devshardstorage.ManagedStorage, evict func(cutoff uint64)) (cancel func()) {
 			return rc.OnEpochChange(func(_, _ uint64) {
 				store.PruneOnceAsync(ctx)
+				if evict != nil {
+					evict(store.PruneCutoff())
+				}
 			})
 		},
 		Source: paramsSourceChain,

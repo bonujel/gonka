@@ -579,9 +579,23 @@ func (am AppModule) EndBlock(ctx context.Context) error {
 		// Apply early network protection if conditions are met
 		finalComputeResult := am.applyEarlyNetworkProtection(ctx, computeResult)
 
-		_, err = am.keeper.Staking.SetComputeValidators(ctx, finalComputeResult, testenv.IsTestNet())
-		if err != nil {
-			am.LogError("Unable to update epoch group", types.EpochGroup, "error", err.Error())
+		// Safety mechanism: never hand the staking module a validator set with
+		// no positive power. SetComputeValidators deletes validators absent from
+		// the compute results, so an empty (or all-zero) set would wipe every
+		// validator and halt consensus. Keep the existing validators instead.
+		if !hasPositiveComputePower(finalComputeResult) {
+			am.LogError("EndBlock: refusing to apply validator update with no positive-power validators; keeping current validator set", types.EpochGroup,
+				"blockHeight", blockHeight, "len(computeResult)", len(finalComputeResult))
+			sdkCtx.EventManager().EmitEvent(sdk.NewEvent(
+				"epoch_error",
+				sdk.NewAttribute("stage", "set_compute_validators"),
+				sdk.NewAttribute("error_category", "empty_validator_set"),
+			))
+		} else {
+			_, err = am.keeper.Staking.SetComputeValidators(ctx, finalComputeResult, testenv.IsTestNet())
+			if err != nil {
+				am.LogError("Unable to update epoch group", types.EpochGroup, "error", err.Error())
+			}
 		}
 		currentEpochGroup.MarkUnchanged(ctx)
 	}
@@ -697,9 +711,33 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 	}
 
 	activeParticipants := am.ComputeNewWeights(ctx, *upcomingEpoch)
-	if activeParticipants == nil {
-		am.LogError("onEndOfPoCValidationStage: computeResult == nil && activeParticipants == nil", types.PoC)
-		return
+	if len(activeParticipants) == 0 {
+		// Safety mechanism: a PoC round where nobody passed validation must not
+		// produce an empty epoch. An empty epoch group can never validate anyone
+		// in later rounds (voting powers derive from it), permanently stalling
+		// the network. Re-seat the current epoch's still-valid validators
+		// instead; see epoch_fallback.go for the carry-over rules.
+		am.LogError("onEndOfPoCValidationStage: no validated participants for upcoming epoch; falling back to current epoch validators", types.PoC,
+			"upcomingEpoch.Index", upcomingEpoch.Index)
+		activeParticipants = am.fallbackActiveParticipantsFromCurrentEpoch(ctx, *upcomingEpoch)
+		if len(activeParticipants) == 0 {
+			am.LogError("onEndOfPoCValidationStage: fallback produced no participants; aborting epoch formation", types.PoC,
+				"upcomingEpoch.Index", upcomingEpoch.Index)
+			sdkCtx := sdk.UnwrapSDKContext(ctx)
+			sdkCtx.EventManager().EmitEvent(sdk.NewEvent(
+				"epoch_error",
+				sdk.NewAttribute("stage", "empty_epoch_fallback"),
+				sdk.NewAttribute("epoch", fmt.Sprintf("%d", upcomingEpoch.Index)),
+				sdk.NewAttribute("error_category", "epoch_formation"),
+			))
+			return
+		}
+		sdkCtx := sdk.UnwrapSDKContext(ctx)
+		sdkCtx.EventManager().EmitEvent(sdk.NewEvent(
+			"empty_epoch_fallback_applied",
+			sdk.NewAttribute("epoch", fmt.Sprintf("%d", upcomingEpoch.Index)),
+			sdk.NewAttribute("participants", fmt.Sprintf("%d", len(activeParticipants))),
+		))
 	}
 
 	modelAssigner := NewModelAssigner(am.keeper, am.keeper)
@@ -750,11 +788,20 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 		upcomingEpoch.Index,
 		penaltyStartEpochByModel,
 	)
-	acc.Apply(activeParticipants)
+	penalties := acc.RewardPenalties()
+	rewardTransfers := BuildDelegationRewardTransfers(
+		participationState.calculator,
+		participationState.eligibleModels,
+		participationState.participationByModel,
+		adjParams,
+		upcomingEpoch.Index,
+		penaltyStartEpochByModel,
+	)
+	allRewardTransfers := rewardTransfers.Records()
 
-	afterPenalty := make(map[string]int64, len(activeParticipants))
+	beforeCollateral := make(map[string]int64, len(activeParticipants))
 	for _, p := range activeParticipants {
-		afterPenalty[p.Index] = p.Weight
+		beforeCollateral[p.Index] = p.Weight
 	}
 
 	// Adjust weights based on collateral after the grace period. This modifies the weights in-place.
@@ -792,7 +839,7 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 	emitWeightPipelineLogs(am, upcomingEpoch.Index, groupSummaries,
 		participationState.eligibleModels, activeParticipants,
 		participationState.participationByModel,
-		consensusWeights, afterPenalty, acc)
+		consensusWeights, beforeCollateral, acc)
 
 	am.LogInfo("onEndOfPoCValidationStage: computed new weights", types.Stages,
 		"upcomingEpoch.Index", upcomingEpoch.Index,
@@ -828,6 +875,14 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 	}
 
 	upcomingEg.GroupData.ConfirmationWeightScales = confirmationWeightScales
+	if err := am.keeper.SetDelegationRewardTransferSnapshot(ctx, types.DelegationRewardTransferSnapshot{
+		EpochIndex: upcomingEpoch.Index,
+		Transfers:  allRewardTransfers,
+		Penalties:  penalties,
+	}); err != nil {
+		am.LogError("onEndOfPoCValidationStage: failed to store delegation reward transfer snapshot", types.PoC, "error", err)
+		return
+	}
 	am.keeper.SetEpochGroupData(ctx, *upcomingEg.GroupData)
 
 	am.addEpochMembers(ctx, upcomingEg, activeParticipants)
@@ -1354,6 +1409,19 @@ func (am AppModule) applyEpochPowerCapping(ctx context.Context, activeParticipan
 	}
 
 	return result.CappedParticipants
+}
+
+// hasPositiveComputePower reports whether at least one compute result carries
+// positive power. SetComputeValidators filters non-positive entries and deletes
+// validators missing from the results, so applying a set without any positive
+// power would remove every validator.
+func hasPositiveComputePower(computeResults []stakingkeeper.ComputeResult) bool {
+	for _, cr := range computeResults {
+		if cr.Power > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // applyEarlyNetworkProtection applies genesis guardian enhancement to compute results before validator set updates
